@@ -12,7 +12,7 @@ edition = "2021"
 
 [dependencies]
 async-trait = "0.1"
-axum-core = "0.4"
+axum-core = { version = "0.4", git = "https://github.com/tokio-rs/axum", rev = "bd3eaa78866127bb9106972f55190cf9fcf3305c" }
 base64 = "0.22"
 bytes = "1"
 futures-util = { version = "0.3", features = ["sink"] }
