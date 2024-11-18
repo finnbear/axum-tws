@@ -187,6 +187,8 @@ impl<F> WebSocketUpgrade<F> {
         });
 
         if let Some(sec_websocket_key) = &self.sec_websocket_key {
+            // If `sec_websocket_key` was `Some`, we are using HTTP/1.1.
+
             #[allow(clippy::declare_interior_mutable_const)]
             const UPGRADE: HeaderValue = HeaderValue::from_static("upgrade");
             #[allow(clippy::declare_interior_mutable_const)]
