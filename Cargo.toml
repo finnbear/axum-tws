@@ -10,6 +10,9 @@ readme = "README.md"
 version = "0.4.0"
 edition = "2021"
 
+[features]
+http2 = ["hyper/http2"]
+
 [dependencies]
 async-trait = "0.1"
 axum-core = "0.4"
