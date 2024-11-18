@@ -87,7 +87,7 @@ where
             Some(sec_websocket_key)
         } else {
             if parts.method != Method::CONNECT {
-                return Err(WebSocketError::MethodNotGet);
+                return Err(WebSocketError::MethodNotConnect);
             }
 
             // if this feature flag is disabled, we won’t be receiving an HTTP/2 request to begin
