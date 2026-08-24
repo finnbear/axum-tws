@@ -303,7 +303,7 @@ impl<F> WebSocketUpgrade<F> {
             handshake: Some(Handshake {
                 on_upgrade: self.on_upgrade,
                 callback,
-                config: self.config.clone(),
+                config: self.config,
                 limits: self.limits,
                 protocol: self.protocol.clone(),
                 on_failed_upgrade: self.on_failed_upgrade,
