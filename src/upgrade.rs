@@ -1,15 +1,140 @@
 use std::future::Future;
+use std::pin::Pin;
+use std::task::{ready, Context, Poll};
 
 use axum_core::body::Body;
 use axum_core::extract::FromRequestParts;
 use axum_core::response::Response;
 use http::request::Parts;
 use http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Version};
+use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
+use pin_project_lite::pin_project;
 use sha1_smol::Sha1;
+use task::{Handshake, UpgradeTask};
 use tokio_websockets::{Config, Limits};
 
 use crate::{websocket::WebSocket, WebSocketError};
+pub use bounds::UpgradeExec;
+
+mod task {
+    use super::*;
+
+    pin_project! {
+        /// Await the handshake, build the socket, and run the callback on it.
+        #[project = UpgradeTaskProj]
+        pub enum UpgradeTask<C, Fut, F> {
+            /// `handshake` temporarily becomes `None` during the handshake, and
+            /// stays `None` on handshake failure.
+            Handshaking { handshake: Option<Handshake<C, F>> },
+            Running {
+                #[pin]
+                future: Fut,
+            },
+        }
+    }
+
+    pub struct Handshake<C, F> {
+        pub on_upgrade: OnUpgrade,
+        pub callback: C,
+        pub config: Config,
+        pub limits: Limits,
+        pub protocol: Option<HeaderValue>,
+        pub on_failed_upgrade: F,
+    }
+
+    impl<C, Fut, F> Future for UpgradeTask<C, Fut, F>
+    where
+        C: FnOnce(WebSocket) -> Fut,
+        Fut: Future<Output = ()>,
+        F: OnFailedUpgrade,
+    {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            loop {
+                let next = match self.as_mut().project() {
+                    UpgradeTaskProj::Handshaking { handshake } => {
+                        let pending = handshake
+                            .as_mut()
+                            .expect("`UpgradeTask` polled after completion");
+                        let upgraded = ready!(Pin::new(&mut pending.on_upgrade).poll(cx));
+
+                        let Handshake {
+                            callback,
+                            config,
+                            limits,
+                            protocol,
+                            on_failed_upgrade,
+                            ..
+                        } = handshake.take().expect("`as_mut` above proved it is set");
+
+                        match upgraded {
+                            Ok(upgraded) => {
+                                let stream = tokio_websockets::server::Builder::new()
+                                    .config(config)
+                                    .limits(limits)
+                                    .serve(TokioIo::new(upgraded));
+                                Self::Running {
+                                    future: callback(WebSocket::new(stream, protocol)),
+                                }
+                            }
+                            Err(err) => {
+                                on_failed_upgrade.call(WebSocketError::UpgradeFailed(err));
+                                return Poll::Ready(());
+                            }
+                        }
+                    }
+                    UpgradeTaskProj::Running { future } => {
+                        return future.poll(cx);
+                    }
+                };
+
+                self.as_mut().set(next);
+            }
+        }
+    }
+}
+
+mod bounds {
+    use super::{OnFailedUpgrade, UpgradeTask};
+    use hyper::rt::Executor;
+
+    /// An executor that can drive a WebSocket upgrade.
+    ///
+    /// Implemented automatically for every [`Executor`] that accepts this
+    /// crate's private upgrade future, which is every executor generic over
+    /// its future.
+    ///
+    /// [`Executor`]: hyper::rt::Executor
+    pub trait UpgradeExec<C, Fut, F>: sealed::Sealed<(C, Fut, F)> {
+        #[doc(hidden)]
+        fn execute_upgrade(&self, task: UpgradeTask<C, Fut, F>);
+    }
+
+    impl<E, C, Fut, F> UpgradeExec<C, Fut, F> for E
+    where
+        E: Executor<UpgradeTask<C, Fut, F>>,
+        F: OnFailedUpgrade,
+    {
+        fn execute_upgrade(&self, task: UpgradeTask<C, Fut, F>) {
+            self.execute(task);
+        }
+    }
+
+    mod sealed {
+        use super::{Executor, OnFailedUpgrade, UpgradeTask};
+
+        pub trait Sealed<T> {}
+
+        impl<E, C, Fut, F> Sealed<(C, Fut, F)> for E
+        where
+            E: Executor<UpgradeTask<C, Fut, F>>,
+            F: OnFailedUpgrade,
+        {
+        }
+    }
+}
 
 pub trait OnFailedUpgrade: Send + 'static {
     fn call(self, error: WebSocketError);
@@ -151,6 +276,10 @@ impl<F> WebSocketUpgrade<F> {
         }
     }
 
+    /// Completes the upgrade, driving the socket on the Tokio runtime.
+    ///
+    /// Equivalent to [`Self::on_upgrade_with`] given a
+    /// [`hyper_util::rt::TokioExecutor`].
     #[must_use = "to set up the WebSocket connection, this response must be returned"]
     pub fn on_upgrade<C, Fut>(self, callback: C) -> Response
     where
@@ -158,30 +287,27 @@ impl<F> WebSocketUpgrade<F> {
         Fut: Future<Output = ()> + Send + 'static,
         F: OnFailedUpgrade,
     {
-        let on_upgrade = self.on_upgrade;
-        let config = self.config;
-        let limits = self.limits;
-        let on_failed_upgrade = self.on_failed_upgrade;
+        self.on_upgrade_with(hyper_util::rt::TokioExecutor::new(), callback)
+    }
 
-        let protocol = self.protocol.clone();
-
-        tokio::spawn(async move {
-            let upgraded = match on_upgrade.await {
-                Ok(upgraded) => upgraded,
-                Err(err) => {
-                    on_failed_upgrade.call(WebSocketError::UpgradeFailed(err));
-                    return;
-                }
-            };
-            let upgraded = TokioIo::new(upgraded);
-
-            let socket = tokio_websockets::server::Builder::new()
-                .config(config)
-                .limits(limits)
-                .serve(upgraded);
-
-            let socket = WebSocket::new(socket, protocol);
-            callback(socket).await;
+    /// Completes the upgrade, driving the socket on `executor`.
+    #[must_use = "to set up the WebSocket connection, this response must be returned"]
+    pub fn on_upgrade_with<E, C, Fut>(self, executor: E, callback: C) -> Response
+    where
+        E: UpgradeExec<C, Fut, F>,
+        C: FnOnce(WebSocket) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+        F: OnFailedUpgrade,
+    {
+        executor.execute_upgrade(UpgradeTask::Handshaking {
+            handshake: Some(Handshake {
+                on_upgrade: self.on_upgrade,
+                callback,
+                config: self.config.clone(),
+                limits: self.limits,
+                protocol: self.protocol.clone(),
+                on_failed_upgrade: self.on_failed_upgrade,
+            }),
         });
 
         let mut response = if let Some(sec_websocket_key) = &self.sec_websocket_key {
